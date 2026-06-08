@@ -2,25 +2,25 @@
 """
 TinyBard — Micro Interactive Text Adventure Generator
 ======================================================
-Exposes a custom gr.Server FastAPI application with a retro CRT terminal frontend.
-Exposes endpoints as Gradio APIs for MCP tool integration.
+Custom FastAPI app with Gradio Blocks mounted for MCP tool integration.
+Retro CRT terminal frontend served as static HTML.
 
 Targets: Thousand Token Wood + Tiny Titan + Llama Champion tracks.
-Badges: Llama Champion, Tiny Titan, Off-Brand (gr.Server), Off the Grid, Field Notes.
+Badges: Llama Champion, Tiny Titan, Off-Brand (custom frontend), Off the Grid, Field Notes.
 """
 
 import os
-import sys
 import json
 import random
 import logging
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List
 
-from fastapi import FastAPI, HTTPException
+import gradio as gr
+from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from gradio import Server
+from gradio import mount_gradio_app
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,9 +31,12 @@ log = logging.getLogger("tinybard")
 # ---------------------------------------------------------------------------
 # Config & Paths
 # ---------------------------------------------------------------------------
+BASE_DIR = Path(__file__).parent
+STATIC_DIR = BASE_DIR / "static"
+
 MODEL_PATH = os.environ.get(
     "TINYBARD_MODEL_PATH",
-    "/Volumes/1tb-sandisk/ml-models/huggingface/models--mradermacher--VibeThinker-1.5B-GGUF/snapshots/d0d66139a78030a92a582f966b0f7cbbb3b19406/VibeThinker-1.5B.Q8_0.gguf"
+    str(Path("/Volumes/1tb-sandisk/ml-models/huggingface/models--mradermacher--VibeThinker-1.5B-GGUF/snapshots/d0d66139a78030a92a582f966b0f7cbbb3b19406/VibeThinker-1.5B.Q8_0.gguf"))
 )
 
 # ---------------------------------------------------------------------------
@@ -42,7 +45,9 @@ MODEL_PATH = os.environ.get(
 _llm = None
 _llm_failed = False
 
+
 def get_llm():
+    """Lazy-load the GGUF model via llama-cpp-python."""
     global _llm, _llm_failed
     if _llm is not None:
         return _llm
@@ -69,6 +74,7 @@ def get_llm():
         log.error(f"Failed to load LLM model: {e}")
         _llm_failed = True
         return None
+
 
 # ---------------------------------------------------------------------------
 # Procedural Fallback Adventure Engine
@@ -120,7 +126,7 @@ GENRES = {
                 "choices": ["Accept the shady patch", "Decline and buy a neural booster", "Threaten him for info"]
             },
             {
-                "story": "A corporate agent corner you in a wet alleyway. He demands your datapad.",
+                "story": "A corporate agent corners you in a wet alleyway. He demands your datapad.",
                 "choices": ["Upload a virus to his cyber-eyes", "Hand over a fake datapad", "Sprint up the fire escape"]
             },
             {
@@ -133,9 +139,11 @@ GENRES = {
     }
 }
 
+
 def generate_procedural_step(genre: str, step: int, health: int, choice: str = "") -> dict:
+    """Generate a fallback adventure step without LLM."""
     genre_data = GENRES.get(genre.lower(), GENRES["fantasy"])
-    
+
     if step == 0:
         return {
             "story": genre_data["start"],
@@ -144,11 +152,10 @@ def generate_procedural_step(genre: str, step: int, health: int, choice: str = "
             "step": 1,
             "game_over": False
         }
-    
-    # Simple logic to resolve choice and advance
+
     health_delta = random.choice([-15, 0, 10])
     new_health = max(0, min(100, health + health_delta))
-    
+
     if new_health <= 0:
         return {
             "story": f"After choosing: '{choice}'. " + genre_data["lose"],
@@ -157,7 +164,7 @@ def generate_procedural_step(genre: str, step: int, health: int, choice: str = "
             "step": step + 1,
             "game_over": True
         }
-        
+
     if step >= 4:
         return {
             "story": f"After choosing: '{choice}'. " + genre_data["win"],
@@ -166,7 +173,7 @@ def generate_procedural_step(genre: str, step: int, health: int, choice: str = "
             "step": step + 1,
             "game_over": True
         }
-        
+
     node = genre_data["nodes"][step % len(genre_data["nodes"])]
     return {
         "story": f"You choose: '{choice}'.\n\n{node['story']}",
@@ -176,10 +183,12 @@ def generate_procedural_step(genre: str, step: int, health: int, choice: str = "
         "game_over": False
     }
 
+
 # ---------------------------------------------------------------------------
 # LLM Generation Logic
 # ---------------------------------------------------------------------------
 def generate_llm_story(prompt: str, max_tokens: int = 150) -> str:
+    """Generate story text via llama.cpp."""
     llm = get_llm()
     if not llm:
         return ""
@@ -195,8 +204,9 @@ def generate_llm_story(prompt: str, max_tokens: int = 150) -> str:
         log.error(f"LLM generation error: {e}")
         return ""
 
+
 def format_prompt(genre: str, history: List[Dict[str, str]], next_instruction: str) -> str:
-    # A lightweight prompt template for VibeThinker/Qwen
+    """Build the narrative prompt for the LLM."""
     prompt = (
         "You are the narrator of an interactive text adventure game.\n"
         f"Genre: {genre}\n"
@@ -210,162 +220,185 @@ def format_prompt(genre: str, history: List[Dict[str, str]], next_instruction: s
             prompt += f"Player choice: {h['text']}\n"
         else:
             prompt += f"Narrator: {h['text']}\n"
-            
+
     prompt += f"{next_instruction}\n"
     return prompt
 
+
 # ---------------------------------------------------------------------------
-# Web Server
+# Gradio Blocks — API endpoints (exposed as MCP tools)
 # ---------------------------------------------------------------------------
-app = Server()
+def create_gradio_app() -> gr.Blocks:
+    """Build the Gradio Blocks app with API endpoints for MCP integration."""
 
-# Serve static directory if it exists
-STATIC_DIR = Path(__file__).parent / "static"
-STATIC_DIR.mkdir(exist_ok=True)
+    with gr.Blocks(title="TinyBard API") as blocks:
+        # Hidden state — not rendered in UI, used by API
+        genre_input = gr.Textbox(label="Genre", visible=False)
+        step_input = gr.Number(label="Step", value=0, visible=False)
+        health_input = gr.Number(label="Health", value=100, visible=False)
+        choice_input = gr.Textbox(label="Choice", visible=False)
+        history_input = gr.Textbox(label="History JSON", value="[]", visible=False)
 
-# Main game state in memory (for simplicity and demo purposes)
-# In production / Spaces multi-user, state should be client-side (passed back/forth)
-# We support passing state back/forth via request/response to remain stateless!
+        # Output fields
+        story_output = gr.Textbox(label="Story")
+        choices_output = gr.JSON(label="Choices")
+        health_output = gr.Number(label="Health")
+        step_output = gr.Number(label="Step")
+        game_over_output = gr.Checkbox(label="Game Over")
+        history_output = gr.Textbox(label="History JSON")
 
-@app.api(name="start_game")
-def start_game(genre: str) -> dict:
-    """
-    Start a new interactive text adventure in the chosen genre (e.g. Fantasy, Sci-Fi, Cyberpunk).
-    Exposed as an MCP tool!
-    """
-    genre = genre.lower()
-    if genre not in ["fantasy", "scifi", "cyberpunk"]:
-        genre = "fantasy"
-        
-    llm = get_llm()
-    if not llm:
-        # Fallback
-        return generate_procedural_step(genre, 0, 100)
+        def api_start_game(genre: str):
+            """Start a new interactive text adventure. Exposed as MCP tool."""
+            genre = genre.lower()
+            if genre not in ["fantasy", "scifi", "cyberpunk"]:
+                genre = "fantasy"
 
-    # Initial prompt
-    instruction = "Narrate the beginning of the adventure. What happens first? Do not offer choices yet."
-    story = generate_llm_story(format_prompt(genre, [], instruction))
-    if not story:
-        return generate_procedural_step(genre, 0, 100)
+            llm = get_llm()
+            if not llm:
+                result = generate_procedural_step(genre, 0, 100)
+                return (
+                    result["story"], result["choices"], result["health"],
+                    result["step"], result["game_over"],
+                    json.dumps(result.get("history", []))
+                )
 
-    # Get initial choices
-    history = [{"role": "narrator", "text": story}]
-    choices_instruction = (
-        "Provide exactly 3 short, distinct choices for the player to make next. "
-        "Format: 1. [choice 1] | 2. [choice 2] | 3. [choice 3]"
-    )
-    choices_text = generate_llm_story(format_prompt(genre, history, choices_instruction), max_tokens=60)
-    
-    # Parse choices
+            instruction = "Narrate the beginning of the adventure. What happens first? Do not offer choices yet."
+            story = generate_llm_story(format_prompt(genre, [], instruction))
+            if not story:
+                result = generate_procedural_step(genre, 0, 100)
+                return (
+                    result["story"], result["choices"], result["health"],
+                    result["step"], result["game_over"],
+                    json.dumps(result.get("history", []))
+                )
+
+            history = [{"role": "narrator", "text": story}]
+            choices_instruction = (
+                "Provide exactly 3 short, distinct choices for the player. "
+                "Format: 1. [choice 1] | 2. [choice 2] | 3. [choice 3]"
+            )
+            choices_text = generate_llm_story(format_prompt(genre, history, choices_instruction), max_tokens=60)
+
+            choices = _parse_choices(choices_text)
+            if len(choices) < 2:
+                choices = ["Explore the area", "Check your equipment", "Proceed carefully"]
+
+            return (story, choices[:3], 100, 1, False, json.dumps(history))
+
+        def api_make_choice(choice: str, genre: str, step: int, health: int, history_json: str):
+            """Submit a player choice to advance the story. Exposed as MCP tool."""
+            try:
+                history = json.loads(history_json)
+            except Exception:
+                history = []
+
+            llm = get_llm()
+            step = int(step)
+            health = int(health)
+
+            if not llm:
+                result = generate_procedural_step(genre, step, health, choice)
+                return (
+                    result["story"], result["choices"], result["health"],
+                    result["step"], result["game_over"],
+                    json.dumps(result.get("history", history))
+                )
+
+            history.append({"role": "player", "text": choice})
+
+            health_delta = random.choice([-15, 0, 10])
+            new_health = max(0, min(100, health + health_delta))
+
+            if new_health <= 0:
+                instruction = "The player has run out of health. Narrate a quick, dramatic end. Game Over."
+                story = generate_llm_story(format_prompt(genre, history, instruction))
+                return (
+                    story or "Your strength fails. The adventure ends in darkness.",
+                    [], 0, step + 1, True, json.dumps(history)
+                )
+
+            if step >= 4:
+                instruction = "Narrate the final glorious victory. The adventure ends in success."
+                story = generate_llm_story(format_prompt(genre, history, instruction))
+                return (
+                    story or "You have achieved your goal! You are victorious!",
+                    [], new_health, step + 1, True, json.dumps(history)
+                )
+
+            instruction = "Narrate what happens next as a result of the player's choice."
+            story = generate_llm_story(format_prompt(genre, history, instruction))
+            if not story:
+                result = generate_procedural_step(genre, step, health, choice)
+                return (
+                    result["story"], result["choices"], result["health"],
+                    result["step"], result["game_over"],
+                    json.dumps(result.get("history", history))
+                )
+
+            history.append({"role": "narrator", "text": story})
+
+            choices_instruction = (
+                "Provide exactly 3 short, distinct choices. "
+                "Format: 1. [choice 1] | 2. [choice 2] | 3. [choice 3]"
+            )
+            choices_text = generate_llm_story(format_prompt(genre, history, choices_instruction), max_tokens=60)
+
+            choices = _parse_choices(choices_text)
+            if len(choices) < 2:
+                choices = ["Move forward", "Look around", "Rest a moment"]
+
+            return (story, choices[:3], new_health, step + 1, False, json.dumps(history))
+
+        # Register API endpoints
+        gr.Button("Start Game").click(
+            fn=api_start_game,
+            inputs=[genre_input],
+            outputs=[story_output, choices_output, health_output, step_output, game_over_output, history_output],
+            api_name="start_game"
+        )
+
+        gr.Button("Make Choice").click(
+            fn=api_make_choice,
+            inputs=[choice_input, genre_input, step_input, health_input, history_input],
+            outputs=[story_output, choices_output, health_output, step_output, game_over_output, history_output],
+            api_name="make_choice"
+        )
+
+    return blocks
+
+
+def _parse_choices(choices_text: str) -> List[str]:
+    """Parse LLM choice output into a list of choices."""
     choices = []
     if "|" in choices_text:
         choices = [c.split(".")[-1].strip() for c in choices_text.split("|")]
     else:
-        # standard list parsing
         for line in choices_text.split("\n"):
-            if "." in line or "1" in line or "2" in line or "3" in line:
+            if "." in line or any(d in line for d in "123"):
                 parts = line.split(".", 1)
                 if len(parts) > 1:
                     choices.append(parts[1].strip())
-                    
-    if len(choices) < 2:
-        # Fallback choices
-        choices = ["Explore the area", "Check your equipment", "Proceed carefully"]
+    return choices
 
-    return {
-        "story": story,
-        "choices": choices[:3],
-        "health": 100,
-        "step": 1,
-        "game_over": False,
-        "history": history
-    }
 
-@app.api(name="make_choice")
-def make_choice(choice: str, genre: str, step: int, health: int, history_json: str) -> dict:
-    """
-    Submit a player choice to advance the story.
-    Exposed as an MCP tool!
-    """
-    try:
-        history = json.loads(history_json)
-    except Exception:
-        history = []
+# ---------------------------------------------------------------------------
+# FastAPI App — Custom frontend + Gradio API
+# ---------------------------------------------------------------------------
+fastapi_app = FastAPI(title="TinyBard", docs_url="/docs")
 
-    llm = get_llm()
-    if not llm:
-        return generate_procedural_step(genre, step, health, choice)
 
-    # Add player choice
-    history.append({"role": "player", "text": choice})
-    
-    # Calculate health impact
-    health_delta = random.choice([-15, 0, 10])
-    new_health = max(0, min(100, health + health_delta))
+@fastapi_app.get("/", response_class=HTMLResponse)
+async def homepage():
+    """Serve the retro CRT terminal frontend."""
+    index_path = STATIC_DIR / "index.html"
+    if index_path.exists():
+        return index_path.read_text()
+    return HTMLResponse("<h1>TinyBard retro terminal under construction!</h1>")
 
-    if new_health <= 0:
-        instruction = "The player has run out of health. Narrate a quick, dramatic end to their adventure. Game Over."
-        story = generate_llm_story(format_prompt(genre, history, instruction))
-        return {
-            "story": story or "Your strength fails. The adventure ends in darkness.",
-            "choices": [],
-            "health": 0,
-            "step": step + 1,
-            "game_over": True,
-            "history": history
-        }
 
-    if step >= 4:
-        instruction = "Narrate the final glorious victory of the player. The adventure ends in success."
-        story = generate_llm_story(format_prompt(genre, history, instruction))
-        return {
-            "story": story or "You have achieved your goal! You are victorious!",
-            "choices": [],
-            "health": new_health,
-            "step": step + 1,
-            "game_over": True,
-            "history": history
-        }
-
-    # Narrate step
-    instruction = "Narrate what happens next as a result of the player's choice."
-    story = generate_llm_story(format_prompt(genre, history, instruction))
-    if not story:
-        return generate_procedural_step(genre, step, health, choice)
-
-    history.append({"role": "narrator", "text": story})
-
-    # Get next choices
-    choices_instruction = (
-        "Provide exactly 3 short, distinct choices for the player to make next. "
-        "Format: 1. [choice 1] | 2. [choice 2] | 3. [choice 3]"
-    )
-    choices_text = generate_llm_story(format_prompt(genre, history, choices_instruction), max_tokens=60)
-    
-    choices = []
-    if "|" in choices_text:
-        choices = [c.split(".")[-1].strip() for c in choices_text.split("|")]
-    else:
-        for line in choices_text.split("\n"):
-            if "." in line or "1" in line or "2" in line or "3" in line:
-                parts = line.split(".", 1)
-                if len(parts) > 1:
-                    choices.append(parts[1].strip())
-                    
-    if len(choices) < 2:
-        choices = ["Move forward", "Look around", "Rest a moment"]
-
-    return {
-        "story": story,
-        "choices": choices[:3],
-        "health": new_health,
-        "step": step + 1,
-        "game_over": False,
-        "history": history
-    }
-
-@app.get("/api/model_status")
-def model_status():
+@fastapi_app.get("/api/model_status")
+async def model_status():
+    """Check if the LLM is loaded."""
     llm = get_llm()
     return {
         "available": llm is not None,
@@ -373,21 +406,22 @@ def model_status():
         "fallback": _llm_failed
     }
 
-@app.get("/", response_class=HTMLResponse)
-async def homepage():
-    index_path = STATIC_DIR / "index.html"
-    if index_path.exists():
-        with open(index_path) as f:
-            return f.read()
-    return HTMLResponse("<h1>TinyBard retro terminal under construction!</h1>")
 
 # Mount static files
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+fastapi_app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+# Mount Gradio app at /gradio — this creates the API + MCP endpoints
+gradio_blocks = create_gradio_app()
+mount_gradio_app(fastapi_app, gradio_blocks, path="/gradio")
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Start the Server with MCP capability enabled by default!
-    app.launch(
-        server_name="0.0.0.0",
-        server_port=int(os.environ.get("PORT", "7860")),
-        mcp_server=True
-    )
+    import uvicorn
+    port = int(os.environ.get("PORT", "7860"))
+    log.info(f"Starting TinyBard on port {port}")
+    log.info(f"Frontend: http://localhost:{port}/")
+    log.info(f"Gradio API: http://localhost:{port}/gradio/")
+    log.info(f"MCP schema: http://localhost:{port}/gradio/gradio_api/mcp/schema")
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=port)

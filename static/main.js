@@ -33,13 +33,14 @@ const boot = document.getElementById("boot");
 // Gradio Client
 // ---------------------------------------------------------------------------
 let gradioClient = null;
+const GRADIO_PATH = "/gradio";
 
 async function initClient() {
     try {
         const { Client } = await import(
             "https://cdn.jsdelivr.net/npm/@gradio/client/dist/index.min.js"
         );
-        gradioClient = await Client.connect(GRADIO_CLIENT_URL);
+        gradioClient = await Client.connect(GRADIO_CLIENT_URL + GRADIO_PATH);
         modelStatus.textContent = "MODEL: CONNECTED";
         modelStatus.style.color = "#00ff41";
     } catch (e) {
@@ -60,7 +61,7 @@ async function apiCall(endpoint, payload) {
         }
     }
     // Fallback: direct fetch to gradio API
-    const resp = await fetch(`${GRADIO_CLIENT_URL}/api/${endpoint}`, {
+    const resp = await fetch(`${GRADIO_CLIENT_URL}${GRADIO_PATH}/api/${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ data: Object.values(payload) })
