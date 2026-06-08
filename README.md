@@ -1,6 +1,6 @@
 ---
 title: ᐴ TinyBard ᔔ
-emoji: ☼
+emoji: ☀️
 colorFrom: blue
 colorTo: yellow
 sdk: gradio
